@@ -1,0 +1,22 @@
+name:                couchdb-psql-replication
+version:             0.0.1.0
+synopsis:            Replicate documents from your CouchDB instance (docs) to your PostgreSQL instance (jsonb).
+description:         Please see README.md
+homepage:            https://github.com/AxialExchange/couchdb-psql-replication#readme
+license:             BSD3
+license-file:        LICENSE
+author:              Robert Fischer
+maintainer:          rfischer+stack@axialexchange.com
+copyright:           Copyright: (c) 2016 Axial Exchange
+category:            Database
+build-type:          Simple
+cabal-version:       >=1.10
+
+executable exe
+  hs-source-dirs:      src
+  main-is:             Main.hs
+  default-language:    Haskell2010
+  ghc-options:         -threaded -rtsopts -with-rtsopts=-N -with-rtsopts=-T -with-rtsopts=-G3 -with-rtsopts=-c -O0 -Wall
+  build-depends:       base >= 4.7 && < 5
+               ,       CouchDB >= 1.2.2 && < 1.3
+               ,       ekg >= 0.4.0.11 && < 0.5
