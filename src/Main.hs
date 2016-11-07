@@ -47,11 +47,18 @@ newtype DocId = DocId
 newtype DocRev = DocRev
   {
     revDocId :: DocId,
+    revOrd :: Int,
     revId :: String
   }
 
 revDbName :: DocRev -> DbName
 revDbName doc = docDb $ revDocId doc
+
+revFullId :: DocRev -> String
+revFullId doc = ord ++ "-" ++ id
+  where
+    ord = show $ revOrd doc
+    id = revId doc
 
 newtype ServerAddress = ServerAddress
   {
@@ -61,17 +68,20 @@ newtype ServerAddress = ServerAddress
 
 newtype BackupConfig = BackupConfig
   {
-    dbTableName          :: TableName,
-    historyTableName     :: TableName,
-    attachmentsTableName :: TableName,
-    currentViewName      :: TableName,
-    couchAddress         :: ServerAddress,
-    psqlAddress          :: ServerAddress
-    psqlUsername         :: String,
-    psqlPassword         :: String,
-    psqlDatabase         :: String,
-    psqlConcurrency      :: Int,
-    couchConcurrency     :: Int
+    dbTableName             :: TableName,
+    historyTableName        :: TableName,
+    bodyTableName           :: TableName
+    attachmentsTableName    :: TableName,
+    contentTableName        :: TableName,
+    currentViewName         :: TableName,
+    docAttachmentsViewName  :: TableName,
+    couchAddress            :: ServerAddress,
+    psqlAddress             :: ServerAddress
+    psqlUsername            :: String,
+    psqlPassword            :: String,
+    psqlDatabase            :: String,
+    psqlConcurrency         :: Int,
+    couchConcurrency        :: Int
   }
 
 type BackupM m a = ReaderT BackupConfig m a
@@ -121,7 +131,7 @@ instance ToSql TableName where
 instance ToSql IndexName where
   toSql idx = conventionalize "idx" name True
     where
-      name = (toSql $ indexTable idx) ++ "." ++ (indexName idx)
+      name = (toSql $ indexTable idx) ++ "Table." ++ (indexName idx)
       conventionalize memo [] _ = reverse memo
       conventionalize memo (c:cs) upper =
         case okC of
@@ -134,15 +144,28 @@ instance ToSql IndexName where
               False -> c
               True -> Char.toUpper c
 
-  inReaderT = flip runReaderT
+inReaderT = flip runReaderT
 
-  main :: IO ()
-  main = do
-    _ <- forkServer "0.0.0.0" 8411
-    config <- initBackupConfig
-    let makeWithPsql = initWithPsql config
-    let makeCouchCall = initCouch config
-    (withPsql, couchCall) <- concurrently makeWithPsql makeCouchCall
+newtype DocSummary = DocSummary {
+  dsId :: String,
+  dsKey :: String,
+  dsValue :: Map String String
+}
+dsRev :: DocSummary -> String
+dsRev ds = getRev
+  where
+    getRev = case maybeRev of None -> "Could not retrieve the reference from " ++ ds
+                              Some x -> x
+    maybeRev = lookup "rev" value
+    value = dsValue ds
+
+main :: IO ()
+main = do
+  _ <- forkServer "0.0.0.0" 8411
+  config <- initBackupConfig
+  let makeWithPsql = initWithPsql config
+  let makeCouchCall = initCouch config
+  (withPsql, couchCall) <- concurrently makeWithPsql makeCouchCall
   dbs <- fetchAllDbs config couchCall
   let mapDb = processDb config withPsql couchCall
   _ <- mapConcurrently mapDb dbs
@@ -155,16 +178,17 @@ initBackupConfig = do
     let couchAddr = readCouchAddress readEnv
     let sqlAddr = readPsqlAddress readEnv
     return BackupConfig <$>
-      pure (readEnv "PSQL_TABLE_HISTORY" "history") <*>
-      pure (readEnv "PSQL_TABLE_DELETED" "deleted") <*>
-      pure (readEnv "PSQL_VIEW_CURRENT"  "current") <*>
-      pure (readCouchAddress readEnv) <*>
-      pure (readPsqlAddress readEnv) <*>
-      pure (readEnv "PSQL_USERNAME" "postgres") <*>
-      pure (readEnv "PSQL_PASSWORD" ""        ) <*>
-      pure (readEnv "PSQL_DATABASE" "postgres") <*>
-      pure (readEnv $ read ("PSQL_CONCURRENCY" "100")  :: Int) <*>
-      pure (readEnv $ read ("COUCH_CONCURRENCY" "20")  :: Int)
+      (readEnv "PSQL_TABLE_HISTORY" "history") <*>
+      (readEnv "PSQL_TABLE_DELETED" "deleted") <*>
+      (readEnv "PSQL_VIEW_CURRENT"  "current") <*>
+      (readEnv "PSQL_VIEW_DOCATTS"  "docAttachments") <*>
+      (readCouchAddress readEnv) <*>
+      (readPsqlAddress readEnv) <*>
+      (readEnv "PSQL_USERNAME" "postgres") <*>
+      (readEnv "PSQL_PASSWORD" ""        ) <*>
+      (readEnv "PSQL_DATABASE" "postgres") <*>
+      (readEnv $ read ("PSQL_CONCURRENCY" "100")  :: Int) <*>
+      (readEnv $ read ("COUCH_CONCURRENCY" "20")  :: Int)
   where
     readFromEnv ((key,val):rest) var def | key == var = val
                                          | otherwise = readFromEnv rest var def
@@ -191,7 +215,7 @@ initCouch = do
       method = methodGet,
       port = hostPort addr,
       host = hostName addr,
-      decompress = \_ -> True,
+      decompress = const True,
       cookieJar = None
     }
   }
@@ -200,7 +224,7 @@ initCouch = do
   inReaderT couchCall $ do
     checkCouchConnection
   let getCouch = return couchCall
-  let killCouch = \_ -> return ()
+  let killCouch = const $ return ()
   let concurrency = couchConcurrency config
   pool <- liftIO $ createPool getCouch killCouch 1 600 concurrency
   return $ \req -> withResource pool $ \call -> call req
@@ -251,60 +275,195 @@ ensurePsqlStructure config withPsql = do
     _ <- mapConcurrently $ applyArgs round0
     _ <- mapConcurrently $ applyArgs round1
     _ <- mapConcurrently $ applyArgs round2
+    _ <- mapConcurrently $ applyArgs round3
   where
     applyArgs = map $ \f -> f config withPsql
-    round0 = [
-      ensureDbTable
-    ]
-    round1 = [
-      ensureHistoryTable,
-      ensureAttachmentsTable
-    ]
-    round2 = [
-      ensureCurrentView
-    ]
+    round0 = [ ensureDbTable ]
+    round1 = [ ensureHistoryTable, ensureContentsTable ]
+    round2 = [ ensureCurrentView, ensureAttachmentsTable, ensureBodyTable ]
+    round3 = [ ensureDocAttachmentsView ]
+
+ensureDbTable :: BackupConfig -> WithPsql -> IO ()
+ensureDbTable config withPsql = do
+    executeSql withPsql def
+  where
+    tbl = dbTableName config
+    tblSql = toSql tbl
+    def =
+      "CREATE TABLE IF NOT EXISTS " ++ tblSql ++ " ( " ++
+      "id BIGSERIAL PRIMARY KEY, " ++
+      "name VARCHAR UNIQUE NOT NULL " ++
+      ")"
+
+ensureBodyTable :: BackupConfig -> WithPsql -> IO ()
+ensureBodyTable config withPsql = do
+    executeSql withPsql def
+  where
+    tblSql = toSql $ bodyTableName config
+    historyTableSql = toSql $ historyTableName config
+    def =
+      "CREATE TABLE IF NOT EXISTS " ++ tblSql ++ " ( " ++
+      "id BIGSERIAL PRIMARY KEY, " ++
+      "createdAt TIMESTAMPZ NOT NULL DEFAULT NOW(), " ++
+      "historyId BIGINT NOT NULL REFERENCES " ++ historyTableSql ++ "(id) ON DELETE RESTRICT ON UPDATE CASCADE, " ++
+      "data JSONB NOT NULL " ++
+      ")"
 
 ensureHistoryTable :: BackupConfig -> WithPsql -> IO ()
 ensureHistoryTable config withPsql = do
-    ensureTableOrView tbl def
+    executeSql withPsql def
     _ <- mapConcurrently [
       ensureIndex withPsql (IndexName tbl "docRevIdentifier") True  "dbId, docId, revId",
-      ensureIndex withPsql (IndexName tbl "docRevOrdering")   False "dbId, docId, revOrd",
-      ensureIndex withPsql (IndexName tbl "firstSeenAt")      False "firstSeenAt",
-      ensureIndex withPsql (IndexName tbl "lastSeenAt")       False "lastSeenAt",
+      ensureIndex withPsql (IndexName tbl "docRevOrd")        False "dbId, docId, revOrd",
       ensureIndex withPsql (IndexName tbl "deletedAt")        False "deletedAt"
     ]
   where
-    dbTblSql = toSql $ dbTableName tbl
-    tbl = historyTableName tbl
+    dbTblSql = toSql $ dbTableName config
+    tbl = historyTableName config
     tblSql = toSql tbl
     def =
       "CREATE TABLE IF NOT EXISTS " ++ tblSql ++ " ( " ++
       "id BIGSERIAL PRIMARY KEY, " ++
       "dbId BIGINT NOT NULL REFERENCES " ++ dbTblSql ++ "(id) ON DELETE RESTRICT ON UPDATE CASCADE, " ++
+      "docId VARCHAR NOT NULL, " ++
+      "revId VARCHAR NOT NULL, " ++
+      "revOrd SMALLINT NULL DEFAULT NULL, " ++
       [sql|
-      docId VARCHAR NOT NULL,
-      revId VARCHAR NOT NULL,
-      revOrd INT NOT NULL DEFAULT -2147483648,
       firstSeenAt TIMESTAMPZ NOT NULL DEFAULT NOW(),
       lastSeenAt TIMESTAMPZ NOT NULL DEFAULT NOW(),
-      deletedAt TIMESTAMPZ NULL DEFAULT NULL,
-      content JSONB NULL DEFAULT NULL
+      deletedAt TIMESTAMPZ NULL DEFAULT NULL
       )
       |]
 
-ensureAttachmentsTable :: WithPsql -> BackupConfig -> WithPsql -> IO ()
-ensureAttachmentsTable = undefined
+ensureContentsTable :: BackupConfig -> WithPsql -> IO ()
+ensureContentsTable config withPsql = do
+    executeSql withPsql def
+  where
+    tbl = contentsTableName config
+    tblSql = toSql tbl
+    def =
+      "CREATE TABLE IF NOT EXISTS " ++ tblSql ++ " ( " ++
+      "id BIGSERIAL PRIMARY KEY, " ++
+      "createdAt TIMESTAMPZ NOT NULL DEFAULT NOW(), " ++
+      "data BYTEA NOT NULL UNIQUE " ++
+      ")"
 
-ensureCurrentView :: WithPsql -> BackupConfig -> WithPsql -> IO ()
-ensureCurrentView = undefined
+ensureAttachmentsTable :: BackupConfig -> WithPsql -> IO ()
+ensureAttachmentsTable config withPsql = do
+    executeSql withPsql def
+    ensureIndex withPsql (IndexName tbl "revIdName") True  "revId, name"
+  where
+    tbl = attachmentsTableName config
+    tblSql = toSql tbl
+    historyTblSql = toSql $ historyTableName config
+    contentTblSql = toSql $ contentTableName config
+    def =
+      "CREATE TABLE IF NOT EXISTS " ++ tblSql ++ " ( " ++
+      "id BIGSERIAL PRIMARY KEY, " ++
+      "name VARCHAR NOT NULL, " ++
+      "contentType VARCHAR NOT NULL, " ++
+      "digest VARCHAR NOT NULL, " ++
+      "revId BIGINT NOT NULL REFERENCES " ++ historyTblSql ++ "(id) ON DELETE RESTRICT ON UPDATE CASCADE, " ++
+      "contentId BIGINT NOT NULL REFERENCES " ++ contentTblSql ++ "(id) ON DELETE RESTRICT ON UPDATE CASCADE " ++
+      ")"
 
-ensureTableOrView :: WithPsql -> TableName -> SqlDefinition -> IO ()
-ensureTableOrView withPsql tbl def = do
-  exists <- checkTable withPsql tbl
-  case exists of
-    True -> return ()
-    False -> createTableOrView withPsql tbl def
+ensureCurrentView :: BackupConfig -> WithPsql -> IO ()
+ensureCurrentView config withPsql = do
+    executeSql withPsql def
+  where
+    tbl = currentViewName config
+    tblSql = toSql tbl
+    historyTblSql = toSql $ historyTableName config
+    dbTblSql = toSql $ dbTableName config
+    bodyTblSql = toSql $ bodyTableName config
+    def =
+      "CREATE OR REPLACE VIEW " ++ tbSql ++ " AS " ++
+      "SELECT DISTINCT ON (h.dbId, h.docId) " ++
+      "h.id AS id, h.dbId AS dbId, d.name AS name, h.docId AS docId, " ++
+      "h.firstSeenAt AS firstSeenAt, h.lastSeenAt AS lastSeenAt, h.content AS content" ++
+      "FROM " ++ historyTblSql ++ " h " ++
+      "INNER JOIN " ++ dbTblSql ++ " d ON (d.id = h.dbId) " ++
+      "INNER JOIN " ++ bodyTblSql ++ " b ON (b.historyId = h.id) " ++
+      "WHERE " ++
+        " h.deletedAt IS NULL, " ++
+        " h.revId IS NOT NULL " ++
+      "ORDER BY h.dbId ASC, h.docId ASC, h.revOrd DESC, h.revId DESC "
+
+ensureDocAttachmentsView :: BackupConfig -> WithPsql -> IO ()
+ensureDocAttachmentsView config withPsq = do
+    executeSql withPsql def
+  where
+    tbl = docAttachmentsViewName config
+    tblSql = toSql tbl
+    historyTblSql = toSql $ historyTableName config
+    attachmentsTblSql = toSql $ attachmentsTableName config
+    currentViewSql = toSql $ currentViewName config
+    def =
+      "CREATE OR REPLACE VIEW " ++ tblSql ++ " AS " ++
+      "SELECT DISTINCT ON (h.docId, a.name) " ++
+      "a.id AS id, h.docId AS docId, a.name AS name, a.contentType AS contentType, a.digest AS digest, d.data AS data " ++
+      "FROM " ++ historyTblSql + " h " ++
+      "INNER JOIN " ++ attachmentsTblSql ++ " a ON (h.id = a.revId) " ++
+      "INNER JOIN " ++ contentsTblSql ++ " d ON (a.contentId = d.id) " ++
+      "INNER JOIN " ++ currentViewSql ++ " c ON (c.docId = h.docId) " ++
+      "ORDER BY h.docId DESC, h.revOrd DESC, a.name DESC"
+
+querySql :: ToRow q => WithPsql -> Query -> q -> IO ()
+querySql withPsql query row = withPsql $ \conn -> do
+  _ <- query conn query q
+  return ()
+
+executeSql :: WithPsql -> Query -> IO ()
+executeSql withPsql query = withPsql $ \conn -> do
+  _ <- execute_ conn query
+  return ()
 
 ensureIndex :: WithPsql -> IndexName -> Unique -> ColumnsSql -> IO ()
-ensureIndex withPsql idx uniq cols = undefined
+ensureIndex withPsql idx uniq cols = withPsql $ \conn -> do
+    executeSql_ conn def
+    return ()
+  where
+    uniqueStr = case uniq of
+                  True => " UNIQUE "
+                  False => ""
+    idxName = toSql idx
+    tblName = toSql $ indexTable idx
+    def =
+      "CREATE " ++ uniqueStr ++ " INDEX IF NOT EXISTS " ++
+      idxName ++ " ON " ++ tblName ++ " ( " ++ cols ++ " )"
+
+fetchAllDbs :: BackupConfig -> CouchCall -> IO [DbName]
+fetchAllDbs config couchCall = do
+    dbsStr <- responseBody $ couchCall $ couchRequest "/_all_dbs" Map.empty
+    return $ map DbName $ parseDbs dbsStr
+  where
+    parseDbs :: String -> List String
+    parseDbs str = case decode str of None   -> error ("Could not decode DBs from " ++ str)
+                                      Some x -> x
+
+processDb :: BackupConfig -> WithPsql -> CouchCall -> DbName -> IO ()
+processDb config withPsql couchCall db = do
+    docsStr <- responseBody $ couchCall $ couchRequest $ "/" ++ dbName ++ "/_all_docs" Map.empty
+    let results = parseDocs docsStr
+    let rows = getRows results
+    let maxKey = maximum $ getKeys rows
+    let revs = getRevisions rows
+    docIds <- mapConcurrently mapDoc ids
+    processDocsAfter config withPsql couchCall $ DocId db maxKey
+  where
+    getRevisions :: Map
+    getRows :: Map String Json -> List Json
+    getRows map = case lookup "rows" map of None -> error ("Could not find db rows within " ++ (show map))
+                                            Some x -> x
+    parseDocs :: String -> Map String Json
+    parseDocs str = case decode str of None -> error ("Could not decode documents from " ++ str)
+                                       Some x -> x
+    mapDoc docId = processDoc config withPsql couchCall $ DocId db docId
+    dbName = extractDbName db
+    extractDbName DbName(name) = name
+
+processDocsAfter :: BackupConfig -> WithPsql -> CouchCall -> DocId -> IO ()
+processDocsAfter config withPsql couchCall docId = do
+  where
+    doc
+
