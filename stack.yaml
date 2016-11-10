@@ -4,4 +4,4 @@ packages:
 - '.'
 extra-deps:
 - CouchDB-1.2.2
-resolver: nightly-2016-10-11
+resolver: lts-7.8
