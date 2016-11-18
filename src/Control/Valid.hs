@@ -1,5 +1,5 @@
-module Axial.Control (
-  module Axial.Control
+module Control.Valid (
+  module Control.Valid
 ) where
 
 import Control.Exception
