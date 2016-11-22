@@ -12,7 +12,7 @@ import Data.Ord ( comparing, Ordering )
 import Data.Foldable ( maximumBy )
 import Data.Aeson ( parseJSON, FromJSON, (.:), (.!=), (.:?) )
 import Data.Aeson.Types ( typeMismatch, Parser )
-import Data.ByteString hiding (map, split)
+import Data.ByteString.Lazy hiding (map, split)
 import GHC.Generics (Generic)
 import qualified Data.Aeson as Json
 import qualified Data.HashMap.Strict as Map
@@ -27,6 +27,12 @@ type HashMap = Map.HashMap
 type HttpCallback = HttpRequest -> IO HttpResponse
 type HttpRequest = HTTP.Request
 type HttpResponse = HTTP.Response ByteString
+
+data Client = Client
+  {
+    clientConn :: HttpRequest -> IO HttpResponse
+  }
+type CouchClient = Client
 
 -- |Represents the name of a CouchDB database
 newtype DbName = DbName String deriving (Generic, Read, Show, Eq)
@@ -129,6 +135,8 @@ attDigest stub = afterDash digStr
       | otherwise = afterDash xs
 
 newtype AttachmentStubs = AttachmentStubs [AttachmentStub] deriving (Generic, Show, Read, Eq)
+docAttachmentStubsAsList :: AttachmentStubs -> [AttachmentStub]
+docAttachmentStubsAsList (AttachmentStubs stubs) = stubs
 
 instance FromJSON AttachmentStubs where
   parseJSON (Json.Object o) =
@@ -157,6 +165,9 @@ data DocDetails = DocDetails
     docRevsInfo :: [DocRevInfo], -- The details about revivsions
     docContent :: Json.Object -- Full content of the document
   } deriving (Generic, Show, Read, Eq)
+
+docAttachmentsList :: DocDetails -> [AttachmentStub]
+docAttachmentsList = docAttachmentStubsAsList . docAttachmentStubs
 
 instance FromJSON DocDetails where
   parseJSON (Json.Object o) = DocDetails <$>
@@ -229,9 +240,6 @@ toDocRevList = dbPageDocRevs
 toPageKeyList :: DbPage -> [DbPageKey]
 toPageKeyList = dbPageKeys
 
--- |A client for a particular couch serverr
-data CouchClient
-
 client :: ReplConfig -> IO CouchClient
 -- ^Creates a client matching the given replication configuration
 client = do
@@ -252,7 +260,7 @@ maxKey :: DbPage -> Maybe DbPageKey
 maxKey = do
   undefined
 
-pollChanges :: CouchClient -> [DbName] -> (DocId -> IO ()) -> IO ()
+pollChanges :: ReplConfig -> DbName -> (DocId -> IO ()) -> IO ()
 -- ^Poll for changes in the given database, calling the callback function for each doc id which
 -- is reported to have a change.
 pollChanges = do
@@ -263,3 +271,11 @@ getDocDetails :: CouchClient -> DbName -> DocId -> IO DocDetails
 getDocDetails = do
   undefined
 
+getRevDetails :: CouchClient -> DbName -> DocRev -> IO DocDetails
+-- ^For a given revision specification, retrieve the document details for that revision.
+getRevDetails = do
+  undefined
+
+fetchAttachment :: CouchClient -> DbName -> DocId -> AttachmentStub -> IO ByteString
+fetchAttachment = do
+  undefined
