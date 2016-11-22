@@ -6,6 +6,7 @@
 
 module Couch where
 
+import qualified Data.Char as Char
 import Config
 import Control.Applicative ( (<|>) )
 import Data.Ord ( comparing, Ordering )
@@ -112,6 +113,7 @@ instance FromJSON RevStatus where
         | c == 'm' || c == 'M' = pure RevMissing
         | c == 'd' || c == 'D' = pure RevDeleted
         | c == '"'          = f cs
+        | Char.isSpace c   = f cs
         | otherwise         = typeMismatch ("revision status from string: " ++ str) value
   parseJSON invalid     = typeMismatch "revision status" invalid
 
