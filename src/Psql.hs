@@ -5,21 +5,34 @@
 
 module Psql (module Psql) where
 
-import Data.ByteString.Lazy
 import Codec.Compression.GZip
-import qualified Database.PostgreSQL.Simple as Db
 import Config ( ReplConfig )
-import Couch ( DbName, DocRev, DocId, DocDetails, AttachmentStub )
+import Couch ( DbName(..), DocRev(..), DocId(..), RevId(..), DocDetails, AttachmentStub )
+import Data.ByteString.Lazy
+import qualified Database.PostgreSQL.Simple as Db
 
 -- |Represents a client to the PSQL synchronization
 data Client = Client
   {
-    clientConn :: IO Db.Connection
+    getConn :: IO Db.Connection
   }
 
-client :: ReplConfig -> IO Client
+-- |Represents a record of a revision (without any content)
+data RevRecord = RevRecord
+  {
+    revRecordDb :: DbName,
+    docRev :: DocRev
+  }
+
+revRecordDoc :: RevRecord -> DocId
+revRecordDoc = Couch.docId . docRev
+
+revRecordRev :: RevRecord -> RevId
+revRecordRev = Couch.docRevId . docRev
+
+makeClient :: ReplConfig -> IO Client
 -- ^Generate a client based on the replication configuration.
-client = do
+makeClient = do
   undefined
 
 checkRevisionExists :: Client -> DbName -> DocRev -> IO Bool
@@ -67,6 +80,10 @@ noteDeletedRevision :: Client -> DbName -> DocRev -> IO ()
 noteDeletedRevision = do
   undefined
 
+noteDeletedDocument :: Client -> DbName -> DocId -> IO ()
+noteDeletedDocument = do
+  undefined
+
 ensureAttachment :: Client -> DbName -> DocId -> AttachmentStub -> IO ()
 ensureAttachment = do
   undefined
@@ -74,3 +91,8 @@ ensureAttachment = do
 ensureAttachmentContent :: Client -> DbName -> DocId -> AttachmentStub -> ByteString -> IO ()
 ensureAttachmentContent = do
   undefined
+
+fetchLiveRevisions :: Client -> IO [RevRecord]
+fetchLiveRevisions = do
+  undefined
+

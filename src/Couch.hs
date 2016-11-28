@@ -3,19 +3,27 @@
 {-# LANGUAGE FlexibleContexts    #-}
 {-# LANGUAGE MonadFailDesugaring #-}
 {-# LANGUAGE DeriveGeneric       #-}
+{-# LANGUAGE Rank2Types #-}
 
 module Couch where
 
-import qualified Data.Char as Char
 import Config
 import Control.Applicative ( (<|>) )
-import Data.Ord ( comparing, Ordering )
-import Data.Foldable ( maximumBy )
+import Control.Concurrent.Async
 import Data.Aeson ( parseJSON, FromJSON, (.:), (.!=), (.:?) )
 import Data.Aeson.Types ( typeMismatch, Parser )
-import Data.ByteString.Lazy hiding (map, split)
+import Data.ByteString.Lazy hiding (map, split, null)
+import Data.CaseInsensitive as CI
+import Data.Foldable ( maximumBy )
+import Data.Maybe (fromMaybe)
+import Data.Ord ( comparing, Ordering )
+import Data.Pool
 import GHC.Generics (Generic)
+import Network.HTTP.Simple
+import Network.HTTP.Types (HeaderName)
 import qualified Data.Aeson as Json
+import qualified Data.ByteString.Char8 as B8
+import qualified Data.Char as Char
 import qualified Data.HashMap.Strict as Map
 import qualified Data.Text as Text
 import qualified Network.HTTP.Client as HTTP
@@ -25,13 +33,12 @@ removeQuotesToString :: Text.Text -> String
 removeQuotesToString = removeQuotes . Text.unpack
 
 type HashMap = Map.HashMap
-type HttpCallback = HttpRequest -> IO HttpResponse
 type HttpRequest = HTTP.Request
-type HttpResponse = HTTP.Response ByteString
 
 data Client = Client
   {
-    clientConn :: HttpRequest -> IO HttpResponse
+    fetchBS :: HttpRequest -> IO (HTTP.Response ByteString),
+    fetchJSON :: forall a. FromJSON a => HttpRequest -> IO (HTTP.Response a)
   }
 type CouchClient = Client
 
@@ -41,12 +48,20 @@ instance FromJSON DbName where
   parseJSON (Json.String s) = DbName . removeQuotesToString <$> pure s
   parseJSON invalid        = typeMismatch "Database Name" invalid
 
+dbNameStr :: DbName -> String
+-- ^Provides the database name as a String
+dbNameStr (DbName a) = a
+
 -- |Represents the ID of a document from CouchDB
 newtype DocId = DocId String deriving (Generic, Read, Show, Eq)
 instance FromJSON DocId where
   parseJSON (Json.String s) = DocId . removeQuotesToString <$> pure s
   parseJSON (Json.Object o) = DocId . removeQuotesToString <$> ( ( o .: "_id" <|> o .: "id" ) :: Parser Text.Text )
   parseJSON invalid = typeMismatch "Document ID" invalid
+
+docIdStr :: DocId -> String
+-- ^Provides the document id as a String
+docIdStr (DocId d) = d
 
 -- |Represents the revision of a document
 data DocRev = DocRev
@@ -70,6 +85,7 @@ data RevId = RevId
 
 instance FromJSON RevId where
   parseJSON (Json.String s) = revFromFullId . removeQuotesToString <$> pure s
+  parseJSON (Json.Object o) = revFromFullId . removeQuotesToString <$> ( ( o .: "_rev" <|> o .: "rev" ) :: Parser Text.Text )
   parseJSON invalid = typeMismatch "Revision ID" invalid
 
 revFullId :: RevId -> String
@@ -162,7 +178,7 @@ instance FromJSON AttachmentStubs where
 -- |Represents the details of a document
 data DocDetails = DocDetails
   {
-    docDeleted :: Bool, -- Whether the document was deleted
+    docDetailsDeleted :: Bool, -- Whether the document was deleted
     docAttachmentStubs :: AttachmentStubs, -- The details about attachments
     docRevsInfo :: [DocRevInfo], -- The details about revivsions
     docContent :: Json.Object -- Full content of the document
@@ -242,42 +258,154 @@ toDocRevList = dbPageDocRevs
 toPageKeyList :: DbPage -> [DbPageKey]
 toPageKeyList = dbPageKeys
 
-client :: ReplConfig -> IO CouchClient
+data ChangeSet = ChangeSet
+  {
+    lastSeq :: Maybe String,
+    docChanges :: [DocChange]
+  }
+
+instance FromJSON ChangeSet where
+  parseJSON (Json.Object o) = ChangeSet <$>
+      maybeLastSeq <*>
+      ( o .:? "results" .!= [] )
+    where
+      maybeLastSeq :: Parser (Maybe String)
+      maybeLastSeq = do
+        result <- (o .:? "last_seq" .!= Nothing) :: Parser (Maybe Integer)
+        return $ show <$> result
+  parseJSON invalid = typeMismatch "database changeset" invalid
+
+data DocChange = DocChange
+  {
+    changedDocId :: DocId,
+    changeRevIds :: [RevId],
+    docDeleted :: Bool
+  }
+
+instance FromJSON DocChange where
+  parseJSON (Json.Object o) = DocChange <$>
+    ( o .: "id" ) <*>
+    ( o .: "changes" ) <*>
+    ( o .:? "deleted" .!= False )
+  parseJSON invalid = typeMismatch "document changeset" invalid
+
+
+makeClient :: ReplConfig -> IO CouchClient
 -- ^Creates a client matching the given replication configuration
-client = do
-  undefined
+makeClient config = do
+  throttle <- createPool creator destroyer stripes timeoutSecs concurrency
+  mngr <- HTTP.newManager $ HTTP.defaultManagerSettings { HTTP.managerConnCount = concurrency }
+  return $ Client
+    {
+    fetchBS = couchRequest throttle mngr httpLBS,
+    fetchJSON = couchRequest throttle mngr httpJSON
+    }
+  where
+    couchRequest pool mngr reqFunc = \req ->
+      withResource pool $ const $ do
+        (reqFunc . mangleRequest mngr) req
+    mangleRequest mngr = setRequestIgnoreStatus . (setMngr mngr) . setHost . setPort
+    setMngr mngr = setRequestManager mngr
+    setHost = setRequestHost $ couchHostBS config
+    setPort = setRequestPort $ couchPort config
+    timeoutSecs = 3600
+    stripes = 1
+    creator = return ()
+    destroyer = const $ return ()
+    concurrency = couchConcurrency config
+
+pathToRequest :: String -> IO HttpRequest
+-- ^Given a path, generate a GET Request.
+pathToRequest ('/':path) = pathToRequest path
+pathToRequest path = HTTP.parseRequest fullPath
+  where
+    fullPath = "GET http://couch/" ++ path
+
+pathArgsToObj :: FromJSON a => String -> [(String, String)] -> Client -> IO a
+pathArgsToObj path args client = do
+    req <- pathToRequest path
+    let req' = setReqHeads req
+    resp <- fetchJSON client req'
+    return $ getResponseBody resp
+  where
+    setReqHeads = setRequestHeaders $ convertToHeaders args
+    convertToHeaders :: [(String, String)] -> [(HeaderName, B8.ByteString)]
+    convertToHeaders [] = []
+    convertToHeaders ((a, b):xs) = (CI.mk $ B8.pack a, B8.pack b) : (convertToHeaders xs)
+
+pathToObj :: FromJSON a => String -> Client -> IO a
+pathToObj path client = pathArgsToObj path [] client
 
 getAllDbs :: CouchClient -> IO [DbName]
 -- ^Provides all the DB names, including system databases
-getAllDbs = do
-  undefined
+getAllDbs = pathToObj "/_all_dbs"
+
+dbPagePath :: DbName -> String
+dbPagePath (DbName db) = "/" ++ db ++ "/_all_docs"
 
 getPage :: CouchClient -> DbName -> Maybe DbPageKey -> IO DbPage
 -- ^Provides a page of documents from the database, optionally after some given key
-getPage = do
-  undefined
+getPage client db Nothing = pathToObj (dbPagePath db) client
+getPage client db (Just (DbPageKey key)) =
+  pathArgsToObj (dbPagePath db) [("startkey", key)] client
 
 maxKey :: DbPage -> Maybe DbPageKey
 -- ^Provides the maximum key for a page, or `None` if there are no records on the page.
-maxKey = do
-  undefined
+maxKey (DbPage pages _)
+  | null pages = Nothing
+  | otherwise = Just $ maximumBy (comparing unpacked) pages
+    where
+      unpacked :: DbPageKey -> String
+      unpacked (DbPageKey key) = key
 
-pollChanges :: ReplConfig -> DbName -> (DocId -> IO ()) -> IO ()
+pollChanges :: ReplConfig -> DbName -> (DbName -> DocChange -> IO ()) -> IO ()
 -- ^Poll for changes in the given database, calling the callback function for each doc id which
 -- is reported to have a change.
-pollChanges = do
-  undefined
+pollChanges origConfig db callback = do
+    couch <- makeClient config
+    longpollDb couch db startSeq callback
+  where
+    startSeq = startingSequence config
+    config = origConfig
+      {
+        couchConcurrency = 1,
+        psqlConcurrency = 1
+      }
+
+longpollDb :: CouchClient -> DbName -> String -> (DbName -> DocChange -> IO ()) -> IO ()
+longpollDb couch db since callback = do
+    changes <- pathArgsToObj changesPath args couch
+    _ <- mapConcurrently (callback db) $ docChanges changes
+    let nextSeq = fromMaybe since $ lastSeq changes
+    longpollDb couch db nextSeq callback
+  where
+    changesPath = "/" ++ (dbNameStr db) ++ "/_changes"
+    args =
+      [
+        ("since", since),
+        ("feed", "longpoll"),
+        ("heartbeat", "1000")
+      ]
 
 getDocDetails :: CouchClient -> DbName -> DocId -> IO DocDetails
 -- ^For a given document id, retrieve the document details.
-getDocDetails = do
-  undefined
+getDocDetails couch db doc = pathArgsToObj docDetailsPath args couch
+  where
+    docDetailsPath = "/" ++ (dbNameStr db) ++ "/" ++ (docIdStr doc)
+    args = [ ("revs_info", "true") ]
 
 getRevDetails :: CouchClient -> DbName -> DocRev -> IO DocDetails
 -- ^For a given revision specification, retrieve the document details for that revision.
-getRevDetails = do
-  undefined
+getRevDetails couch db rev = pathArgsToObj revDetailsPath args couch
+  where
+    doc = docId rev
+    revDetailsPath = "/" ++ (dbNameStr db) ++ "/" ++ (docIdStr doc)
+    args = [ ("rev", revFullId . docRevId $ rev) ]
 
 fetchAttachment :: CouchClient -> DbName -> DocId -> AttachmentStub -> IO ByteString
-fetchAttachment = do
-  undefined
+fetchAttachment couch db doc att = do
+    req <- pathToRequest attPath
+    responseBs <- fetchBS couch req
+    return $ getResponseBody responseBs
+  where
+    attPath = "/" ++ (dbNameStr db) ++ "/" ++ (docIdStr doc) ++ "/" ++ (attName att)

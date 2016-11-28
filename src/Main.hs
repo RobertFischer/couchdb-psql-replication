@@ -5,13 +5,15 @@
 
 module Main where
 
-import qualified Couch
-import Couch ( DocId, DbName, DbPage, DocRevInfo, AttachmentStub, docId )
-import qualified Psql
-import qualified Config
-import Data.Maybe ( Maybe(..) )
 import Control.Concurrent.Async
+import Couch ( DocId, DbName, DbPage, DocRevInfo, AttachmentStub, docId )
 import Data.List ( partition )
+import Data.Maybe ( Maybe(..) )
+import qualified Config
+import qualified Couch
+import qualified Psql
+import System.Remote.Monitoring as EKG
+import System.Timeout
 
 type CouchClient = Couch.Client
 type PsqlClient = Psql.Client
@@ -20,17 +22,39 @@ type PsqlClient = Psql.Client
 
 main :: IO ()
 main = do
+    _ <- EKG.forkServer "localhost" 41100
     config <- Config.readConfig
-    psql <- Psql.client config
-    couch <- Couch.client config
+    psql <- Psql.makeClient config
+    couch <- Couch.makeClient config
     dbs <- Couch.getAllDbs couch
-    let bgPoll = mapConcurrently (upDoc config couch psql) dbs
+    let poller = mapConcurrently (upDoc config couch psql) dbs
     let upDb = processDatabase couch psql
-    let upDbs = mapConcurrently upDb dbs
-    _ <- concurrently bgPoll upDbs
-    return ()
+    withAsync poller $ \pollPromise -> do
+      liveRevs <- Psql.fetchLiveRevisions psql
+      _ <- mapConcurrently (processRevisionRecord couch psql) liveRevs
+      _ <- mapConcurrently upDb dbs
+      let timeoutSecs = Config.pollLength config
+      _ <- timeout timeoutSecs $ wait pollPromise
+      return ()
   where
-    upDoc config couch psql db = Couch.pollChanges config db $ processDocument couch psql db
+    upDoc config couch psql = \db -> do
+      let procDoc = processDocumentChange couch psql
+      Couch.pollChanges config db procDoc
+
+processRevisionRecord :: CouchClient -> PsqlClient -> Psql.RevRecord -> IO ()
+processRevisionRecord couch psql rev = processRevision couch psql db docRevInfo
+  where
+    db = Psql.revRecordDb rev
+    docRevInfo = Couch.DocRevInfo
+      {
+        Couch.docRevSpec = docRev,
+        Couch.docRevStatus = Couch.RevAvailable
+      }
+    docRev = Couch.DocRev
+      {
+        Couch.docId = Psql.revRecordDoc rev,
+        Couch.docRevId = Psql.revRecordRev rev
+      }
 
 processDatabase :: CouchClient -> PsqlClient -> DbName -> IO ()
 -- ^Responsible for synchronizing a specific revision
@@ -111,3 +135,22 @@ processAttachment couch psql db doc att = do
     ensureAtt = Psql.ensureAttachment psql db doc att
     fetchContent = Couch.fetchAttachment couch db doc att
     ensureAttContent = Psql.ensureAttachmentContent psql db doc att
+
+processDocumentChange :: CouchClient -> PsqlClient -> DbName -> Couch.DocChange -> IO ()
+processDocumentChange couch psql dbName change = do
+    _ <- mapConcurrently procRev docRevInfos
+    if isDeleted then Psql.noteDeletedDocument psql dbName doc else return ()
+  where
+    procRev = processRevision couch psql dbName
+    docRevInfos = (flip map) (Couch.changeRevIds change) $ \rev -> Couch.DocRevInfo
+      {
+        Couch.docRevSpec = revSpec rev,
+        Couch.docRevStatus = if isDeleted then Couch.RevDeleted else Couch.RevAvailable
+      }
+    revSpec rev = Couch.DocRev
+      {
+        Couch.docId = doc,
+        Couch.docRevId = rev
+      }
+    doc = Couch.changedDocId change
+    isDeleted = Couch.docDeleted change
