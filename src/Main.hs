@@ -109,7 +109,7 @@ processDocument couch psql db doc = do
       let processAtt = processAttachment couch transClient db doc
       _ <- mapConcurrently processRev $ Couch.docRevsInfo details
       _ <- mapConcurrently processAtt $ Couch.docAttachmentsList details
-      return ()
+      if (Couch.docDeleted details) then (Psql.noteDeletedDocument psql db doc) else ( return () )
   where
     ensureDoc = Psql.ensureDocument psql db doc
     fetchDoc = Couch.getDocDetails couch db doc
