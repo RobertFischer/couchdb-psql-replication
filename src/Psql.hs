@@ -205,11 +205,11 @@ tableColumnSql client table
     | table == BaseTable = "id BIGSERIAL PRIMARY KEY, firstSyncAt " ++ nowTime ++ ", lastSyncAt" ++ nowTime
     | table == BaseObjectTable = "couchId VARCHAR NOT NULL"
     | table == DbTable = "UNIQUE (couchId)"
-    | table == DocTable = multi [ refsTable "dbId" DbTable, "deletedAt BOOLEAN NULL DEFAULT NULL", "UNIQUE (dbId, couchId)" ]
+    | table == DocTable = multi [ refsTable "dbId" DbTable, "deletedAt TIMESTAMPZ NULL DEFAULT NULL", "UNIQUE (dbId, couchId)" ]
     | table == RevTable = multi [
         refsTable "docId" DocTable,
         "ord SMALLINT NOT NULL",
-        "deletedAt BOOLEAN NULL DEFAULT NULL",
+        "deletedAt TIMESTAMPZ NULL DEFAULT NULL",
         "UNIQUE (docId, couchId)"
       ]
     | table == RevContentTable = multi [
@@ -219,7 +219,6 @@ tableColumnSql client table
     | table == AttTable = multi [
         refsTable "revId" RevTable,
         "contentType VARCHAR NOT NULL",
-        "contentDigest VARCHAR NOT NULL",
         "UNIQUE (revId, couchId)"
       ]
     | table == AttContentTable = multi [
@@ -265,7 +264,7 @@ compress bs = compressWith params bs
     oneKb = 1024
     oneMb = 1024 * oneKb
     bufferSize = min oneMb (lengthBytes+1)
-    lengthFactor = ceiltToOne $ logBase 2 lengthKb
+    lengthFactor = ceilToOne $ logBase 2 lengthKb
     compression = compressionLevel $ min 9 lengthFactor
     params = defaultCompressParams
       {
@@ -340,7 +339,7 @@ noteDeletedRevision client DbName(db) docRev = callDb client sql [db, doc, rev]
   where
     doc = docIdStr $ docId docRev
     rev = revId $ docRevId docRev
-    sql = "UPDATE " ++ revTable ++ " rev SET deletedAt = COALESCE(rev.deletedAt, NOW()) "
+    sql = "UPDATE " ++ revTable ++ " rev SET deletedAt = COALESCE(rev.deletedAt, NOW()), lastSyncAt = NOW() "
       ++ " FROM " ++ docTable ++ " doc INNER JOIN " ++ dbTable ++ " db ON (doc.dbId = db.id)"
       ++ " WHERE rev.docId = doc.id AND "
       ++ " db.couchId = ? AND doc.couchId = ? AND rev.couchId = ? "
@@ -352,17 +351,51 @@ noteDeletedRevision client DbName(db) docRev = callDb client sql [db, doc, rev]
 noteDeletedDocument :: Client -> DbName -> DocId -> IO ()
 noteDeletedDocument client DbName(db) DocId(doc) = callDb client sql [db, doc]
   where
-    sql = "UPDATE " ++ docTable ++ " doc SET deletedAt = COALESCE(doc.deletedAt, NOW()) "
+    sql = "UPDATE " ++ docTable ++ " doc SET deletedAt = COALESCE(doc.deletedAt, NOW()), lastSyncAt = NOW() "
       ++ " FROM " ++ dbTable ++ " db "
       ++ " WHERE doc.dbId = db.id AND db.couchId = ? and doc.couchId = ? "
+    tblSql = clientTableSql client
+    revTable = tblSql RevTable
+    docTable = tblSql DocTable
+    dbTable = tblSql DbTable
 
 ensureAttachment :: Client -> DbName -> DocId -> AttachmentStub -> IO ()
-ensureAttachment = do
-  undefined
+ensureAttachment client DbName(db) DocId(doc) att = callDb client sql [db, doc, revOrd, name, contentType]
+  where
+    revOrd = attRevPos att
+    name = attName att
+    contentType = attContentType att
+    sql = "INSERT INTO " ++ attTable ++ " (revId, couchId, contentType) VALUES ( "
+      ++ " SELECT rev.id FROM " ++ revTable ++ " rev "
+      ++ " INNER JOIN " ++ docTable ++ " doc ON (rev.docId = doc.id) "
+      ++ " INNER JOIN " ++ dbTable ++ "db ON (doc.dbId = db.id) "
+      ++ " WHERE db.couchId = ? AND doc.couchId = ? AND rev.ord = ? "
+      ++ " ORDER BY rev.deletedAt DESC NULLS LAST, rev.lastSyncAt DESC"
+      ++ " LIMIT 1 "
+      ++ " , ?, ? "
+      ++ " ) " ++ onConflictNoteSync ++ ", contentType = EXCLUDED.contentType"
+    tblSql = clientTableSql client
+    revTable = tblSql RevTable
+    docTable = tblSql DocTable
+    dbTable = tblSql DbTable
+    attTable = tblSql AttTable
 
 ensureAttachmentContent :: Client -> DbName -> DocId -> AttachmentStub -> ByteString -> IO ()
-ensureAttachmentContent = do
-  undefined
+ensureAttachmentContent client DbName(db) DocId(doc) att content = callDb [db, doc, revOrd, name, binContent]
+  where
+    binContent = Binary $ compress content
+    name = attName att
+    revOrd = attRevPos att
+    sql = "INSERT INTO " ++ attContentTable ++ " cnt (gzipped, attId, attContent) VALUES (True, "
+      ++ " SELECT attId FROM " ++ attTable ++ " att "
+      ++ " INNER JOIN " ++ revTable ++ " rev ON (att.revId = rev.id) "
+      ++ " INNER JOIN " ++ docTable ++ " doc ON (rev.docId = doc.id) "
+      ++ " INNER JOIN " ++ dbTable ++ " db ON (rev.dbId = db.id) "
+      ++ " WHERE db.couchId = ? AND doc.couchId = ? AND rev.ord = ? AND att.couchId = ? "
+      ++ " ORDER BY rev.deletedAt DESC NULLS LAST, att.lastSyncAt DESC, rev.lastSyncAt DESC "
+      ++ " LIMIT 1 "
+      ++ ", ?"
+      ++ " ) " ++ onConflictNoteSync ++ ", gzipped = EXCLUDED.gzipped, attContent = EXCLUDED.attContent "
 
 fetchLiveRevisions :: Client -> IO [RevRecord]
 fetchLiveRevisions client = do
