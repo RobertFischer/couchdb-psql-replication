@@ -28,7 +28,7 @@ instance ToSql SchemaName where
 data Table =
     BaseTable | BaseObjectTable | DbTable | DocTable |
     RevTable | RevContentTable | AttTable | AttContentTable |
-    CurrentDbTable | CurrentDocTable | CurrentAttTable
+    CurrentDbTable | CurrentDocTable | CurrentAttTable | CurrentRevTable
   deriving (Show, Read, Eq, Ord, Generic)
 newtype TableName = TableName (SchemaName, String) deriving (Show, Read, Eq, Ord, Generic)
 instance ToSql TableName where
@@ -95,7 +95,7 @@ revRecordRev = Couch.docRevId . docRev
 
 tableSchema :: Table -> Schema
 tableSchema table
-  | table `elem` [CurrentDbTable, CurrentDocTable, CurrentAttTable] = ViewSchema
+  | table `elem` [CurrentRevTable, CurrentDbTable, CurrentDocTable, CurrentAttTable] = ViewSchema
   | otherwise = DataSchema
 
 makeClient :: ReplConfig -> IO Client
@@ -126,6 +126,7 @@ makeClient config = do
                     | table == CurrentDbTable = tableName' "Dbs"
                     | table == CurrentDocTable = tableName' "Docs"
                     | table == CurrentAttTable = tableName' "Atts"
+                    | table == CurrentRevTable = tableName' "Revs"
       where
         tableName' = TableName ( schemaName', tblStr )
         schemaName' = SchemaName $ schemaFunc $ tableSchema table
@@ -158,9 +159,14 @@ ensureDdl baseClient = withTransaction baseClient $ \client -> do
   ensureTable client RevContentTable
   ensureTable client AttTable
   ensureTable client AttContentTable
-  ensureView  client CurrentDbTable
+  ensureView  client CurrentRevTable
   ensureView  client CurrentDocTable
+  ensureView  client CurrentDbTable
   ensureView  client CurrentAttTable
+  ensureIndex client BaseTable (IndexColumns "lastSyncAt")
+  ensureIndex client BaseObjectTable (IndexColumns "deletedAt IS NULL")
+  ensureIndex client BaseObjectTable (IndexColumns "couchId")
+  ensureIndex client RevTable (IndexColumns "ord")
 
 ensureSchema :: Client -> Schema -> IO ()
 ensureSchema client schema = do
@@ -176,6 +182,60 @@ ensureView client table = do
   where
     name = clientTableSql client table
     query = viewQuerySql client table
+
+viewQuerySql :: Client -> Table -> String
+viewQuerySql client table
+    | tableSchema table == DataSchema = error ("No view query SQL for a data schema table: " ++ show table)
+    | table == CurrentDbTable =
+        "SELECT DISTINCT ON (db.couchId) doc.id AS sqlId, db.couchId AS name, "
+        ++ " db.firstSyncAt AS firstSyncAt, db.lastSyncAt AS lastSyncAt"
+        ++ " FROM " ++ dbTable ++ " db "
+        ++ " INNER JOIN " ++ currDocTable ++ " doc  ON (doc.dbSqlId = db.id) "
+        ++ " ORDER BY db.couchId, db.lastSyncAt DESC"
+    | table == CurrentDocTable =
+      "SELECT DISTINCT ON (db.couchId, doc.couchId) "
+      ++ " db.couchId AS dbName, db.id AS dbSqlId, doc.couchId AS couchId, doc.id AS sqlId "
+      ++ " doc.firstSyncAt AS firstSyncAt, doc.lastSyncAt AS lastSyncAt "
+      ++ " FROM " ++ docTable ++ " doc INNER JOIN " ++ dbTable ++ " db ON (doc.dbId = db.id) "
+      ++ " INNER JOIN " ++ currRevTable ++ " rev ON (rev.docSqlId = doc.id) "
+      ++ " WHERE db.deletedAt IS NULL AND doc.deletedAt IS NULL "
+      ++ " ORDER BY db.couchId, doc.couchId, doc.lastSyncAt DESC "
+    | table == CurrentRevTable =
+      "SELECT DISTINCT ON (db.couchId, doc.couchId, rev.ord) "
+      ++ " db.couchId AS dbName, db.id AS dbSqlId, "
+      ++ " doc.couchId AS docCouchId, doc.id AS docSqlId, rev.ord AS ord, rev.id AS sqlId, "
+      ++ " rev.couchId AS couchId, "
+      ++ " CONCAT(rev.ord, '-', rev.couchId) AS fullId, "
+      ++ " rev.lastSyncAt AS lastSyncAt, rev.firstSyncAt AS firstSyncAt "
+      ++ " FROM " ++ revTable ++ " rev "
+      ++ " INNER JOIN " ++ docTable ++ " doc ON (rev.docId = doc.id) "
+      ++ " INNER JOIN " + dbTable ++ " db ON (doc.dbId = db.id) "
+      ++ " WHERE db.deletedAt IS NULL AND doc.deletedAt IS NULL AND rev.deletedAt IS NULL "
+      ++ " ORDER BY db.couchId, doc.couchId, rev.ord, rev.lastSyncAt DESC "
+    | table == CurrentAttTable =
+      "SELECT DISTINCT ON (db.couchId, doc.couchId, att.couchId) "
+      ++ " db.couchId AS dbName, doc.couchId AS docCouchId, doc.sqlId AS docSqlId, "
+      ++ " rev.ord AS revOrd, att.couchId AS name, "
+      ++ " att.id AS sqlId, content.attContent AS content, content.gzipped AS contentGzipped, "
+      ++ " COALESCE(curRev.sqlId, rev.id) AS revSqlId, COALESCE(curRev.couchId, rev.couchId) AS revCouchId "
+      ++ " FROM " ++ attTable ++ " att " ++
+      ++ " INNER JOIN " ++ revTable ++ " rev ON (att.revId = rev.id) "
+      ++ " INNER JOIN " ++ currDocTable ++ " doc ON (rev.docId = doc.sqlId) "
+      ++ " INNER JOIN " + dbTable ++ " db ON (doc.dbSqlId = db.id) "
+      ++ " INNER JOIN " ++ attContentTable ++ " content ON (att.id = content.attId) "
+      ++ " LEFT JOIN " ++ currRevTable ++ " curRev ON (db.id = curRev.dbSqlId AND doc.sqlId = curRev.docSqlId AND rev.ord = curRev.ord) "
+      ++ " ORDER BY db.couchId, doc.couchId, att.couchId, att.lastSyncAt DESC, content.lastSyncAt DESC"
+  where
+    tableSql' = clientTableSql client
+    dbTable = tableSql' DbTable
+    currDocTable = tableSql' CurrentDocTable
+    currRevTable = tableSql' CurrentRevTable
+    attTable = tableSql' AttTable
+    attContentTable = tableSql' AttContentTable
+    revTable = tableSql' RevTable
+    docTable = tableSql' DocTable
+    dbTable = tableSql' DbTable
+
 
 ensureTable :: Client -> Table -> IO ()
 ensureTable client table = do
@@ -201,15 +261,14 @@ tableInheritance _ = [BaseTable, BaseObjectTable]
 
 tableColumnSql :: Client -> Table -> String
 tableColumnSql client table
-    | tableSchema table == ViewSchema = error "No column table SQL for the view schema"
+    | tableSchema table == ViewSchema = error ("No column table SQL for a view schema table: " ++ show table)
     | table == BaseTable = "id BIGSERIAL PRIMARY KEY, firstSyncAt " ++ nowTime ++ ", lastSyncAt" ++ nowTime
-    | table == BaseObjectTable = "couchId VARCHAR NOT NULL"
+    | table == BaseObjectTable = multi [ "couchId VARCHAR NOT NULL", "deletedAt TIMESTAMPZ NULL DEFAULT NULL"]
     | table == DbTable = "UNIQUE (couchId)"
-    | table == DocTable = multi [ refsTable "dbId" DbTable, "deletedAt TIMESTAMPZ NULL DEFAULT NULL", "UNIQUE (dbId, couchId)" ]
+    | table == DocTable = multi [ refsTable "dbId" DbTable, "UNIQUE (dbId, couchId)" ]
     | table == RevTable = multi [
         refsTable "docId" DocTable,
         "ord SMALLINT NOT NULL",
-        "deletedAt TIMESTAMPZ NULL DEFAULT NULL",
         "UNIQUE (docId, couchId)"
       ]
     | table == RevContentTable = multi [
