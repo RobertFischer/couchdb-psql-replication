@@ -4,19 +4,21 @@
 {-# LANGUAGE MonadFailDesugaring #-}
 {-# LANGUAGE DeriveGeneric #-}
 
-module Config where
+module Config (module Config) where
 
+import Control.Concurrent ( forkIO )
 import Data.Default
-import GHC.Generics
-import Data.ByteString as B
-import Data.ByteString.Char8 as B8
+import qualified Data.ByteString as B
+import qualified Data.ByteString.Char8 as B8
+import System.IO
+import GHC.Word
 
 -- |Represents a location of a server on the Internet
 data ServerAddress = ServerAddress
   {
-    serverPort :: Int,
+    serverPort :: Word16,
     serverName :: String
-  } deriving (Generic, Show, Read, Eq, Ord)
+  } deriving (Show, Read, Eq, Ord)
 
 -- |Represents the overall configuration for the replication
 data ReplConfig = ReplConfig
@@ -26,8 +28,12 @@ data ReplConfig = ReplConfig
     startingSequence :: String,
     couchConcurrency :: Int,
     psqlConcurrency :: Int,
-    pollLength :: Int
-  } deriving (Generic, Show, Read, Eq, Ord)
+    pollLength :: Int,
+    psqlSchemaName :: String,
+    psqlUser :: String,
+    psqlPass :: String,
+    psqlDb :: String
+  } deriving (Show, Read, Eq, Ord)
 
 defaultConfig :: ReplConfig
 -- ^The default configuration for replication
@@ -49,4 +55,28 @@ couchHost :: ReplConfig -> String
 couchHost = serverName . couchServer
 
 couchPort :: ReplConfig -> Int
-couchPort = serverPort . couchServer
+couchPort = fromIntegral . serverPort . couchServer
+
+psqlHost :: ReplConfig -> String
+psqlHost = serverName . psqlServer
+
+psqlPort :: ReplConfig -> Word16
+psqlPort = serverPort . psqlServer
+
+doLog :: String -> String -> IO ()
+doLog lvl str = do
+    _ <- forkIO $ do
+      hSetBuffering h LineBuffering
+      hPutStr h $ "[" ++ lvl ++ "]\t" ++ str ++ "\n"
+    return ()
+  where
+    h = stderr
+
+logWarn :: String -> IO ()
+logWarn = doLog "WARN"
+
+logError :: String -> IO ()
+logError = doLog "ERROR"
+
+logInfo :: String -> IO ()
+logInfo = doLog "INFO"
