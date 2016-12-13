@@ -17,7 +17,7 @@ executable exe
   main-is:             Main.hs
   other-modules:       Util, Couch, Psql, Config
   default-language:    Haskell2010
-  ghc-options:         -threaded -with-rtsopts=-N -with-rtsopts=-G3 -with-rtsopts=-c -O3 -Wall -Werror
+  ghc-options:         -threaded -with-rtsopts=-N -O3 -Wall -Werror
   build-depends:       base >= 4.7 && < 5
                ,       ekg >= 0.4.0.11 && < 0.5
                ,       monad-control >= 1.0 && < 1.1

@@ -9,6 +9,7 @@ module Couch where
 
 import Config
 import Control.Applicative ( (<|>) )
+import Control.Concurrent ( yield )
 import Control.Concurrent.Async
 import Data.Aeson ( parseJSON, FromJSON, (.:), (.!=), (.:?) )
 import Data.Aeson.Types ( typeMismatch, Parser )
@@ -318,7 +319,9 @@ makeClient config = do
 pathToRequest :: String -> IO HttpRequest
 -- ^Given a path, generate a GET Request.
 pathToRequest ('/':path) = pathToRequest path
-pathToRequest path = HTTP.parseRequest fullPath
+pathToRequest path = do
+    yield
+    HTTP.parseRequest fullPath
   where
     fullPath = "GET http://couch/" ++ path
 
@@ -368,6 +371,7 @@ pollChanges :: ReplConfig -> DbName -> (DbName -> DocChange -> IO ()) -> IO ()
 -- ^Poll for changes in the given database, calling the callback function for each doc id which
 -- is reported to have a change.
 pollChanges origConfig db callback = do
+    yield
     Config.logInfo $ "Polling for changes in " ++ (show db)
     couch <- makeClient config
     longpollDb couch db startSeq callback
@@ -381,6 +385,7 @@ pollChanges origConfig db callback = do
 
 longpollDb :: CouchClient -> DbName -> String -> (DbName -> DocChange -> IO ()) -> IO ()
 longpollDb couch db since callback = do
+    yield
     Config.logInfo $ "Beginning a long poll round for " ++ (show db)
     changes <- pathArgsToObj changesPath args couch
     _ <- mapConcurrently (callback db) $ docChanges changes

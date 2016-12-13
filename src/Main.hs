@@ -5,6 +5,7 @@
 
 module Main where
 
+import Control.Concurrent ( yield )
 import Control.Concurrent.Async
 import Couch ( DocId, DbName, DbPage, DocRevInfo, AttachmentStub, docId )
 import Data.List ( partition )
@@ -21,26 +22,37 @@ type PsqlClient = Psql.Client
 main :: IO ()
 main = do
     --_ <- EKG.forkServer "localhost" 41100
+    Config.logInfo "Reading config and creating clients"
     config <- Config.readConfig
     psql <- Psql.makeClient config
     couch <- Couch.makeClient config
+    Config.logInfo "Loading DBs starting polling"
     dbs <- Couch.getAllDbs couch
     let poller = mapConcurrently (upDoc config couch psql) dbs
     let upDb = processDatabase couch psql
     withAsync poller $ \pollPromise -> do
+      Config.logInfo "Loading live revisions"
       liveRevs <- Psql.fetchLiveRevisions psql
+      Config.logInfo "Processing live revisions"
       _ <- mapConcurrently (processRevisionRecord couch psql) liveRevs
+      Config.logInfo "Processing databases"
       _ <- mapConcurrently upDb dbs
       let timeoutSecs = Config.pollLength config
+      Config.logInfo $ "Waiting for changeset polling timeout:\t" ++ (show timeoutSecs) ++"s"
       _ <- timeout timeoutSecs $ wait pollPromise
       return ()
   where
     upDoc config couch psql = \db -> do
+      yield
+      Config.logInfo $ "Processing database: " ++ (show db)
       let procDoc = processDocumentChange couch psql
       Couch.pollChanges config db procDoc
 
 processRevisionRecord :: CouchClient -> PsqlClient -> Psql.RevRecord -> IO ()
-processRevisionRecord couch psql rev = processRevision couch psql db docRevInfo
+processRevisionRecord couch psql rev = do
+    yield
+    Config.logInfo $ "Processing revision:\t" ++ (show rev)
+    processRevision couch psql db docRevInfo
   where
     db = Psql.revRecordDb rev
     docRevInfo = Couch.DocRevInfo
@@ -57,6 +69,8 @@ processRevisionRecord couch psql rev = processRevision couch psql db docRevInfo
 processDatabase :: CouchClient -> PsqlClient -> DbName -> IO ()
 -- ^Responsible for synchronizing a specific revision
 processDatabase couch psql db = do
+    yield
+    Config.logInfo $ "Processing database:\t" ++ (show db)
     Psql.ensureDatabase psql db
     firstPage <- getFirstPage
     processDatabasePage couch psql db firstPage
@@ -67,6 +81,8 @@ processDatabase couch psql db = do
 processDatabasePage :: CouchClient -> PsqlClient -> DbName -> DbPage -> IO ()
 -- ^Responsible for processing a given database page, including recursing into subsequent pages
 processDatabasePage couch psql db page = do
+    yield
+    Config.logInfo $ "Processing database page:\t" ++ (show db) ++ "\t" ++ (show page)
     (missingIds, presentIds) <- checkRevs page
     _ <- mapConcurrently processDoc missingIds
     let runPresent = mapConcurrently processDoc presentIds
@@ -87,6 +103,7 @@ checkRevisions :: PsqlClient -> DbName -> DbPage -> IO ([DocId], [DocId])
 -- ^Determines which document ids are not up to the most recent revisions, and which have the most recent revisions.
 -- The left/'fst' list of tuple are the missing ids, and the right/'snd' list of the tuple are the found ids.
 checkRevisions psql db page = do
+    yield
     checked <- mapConcurrently check revList
     let checkedPairs = zip checked revList
     let (presentPairs, missingPairs) = partition fst checkedPairs
@@ -101,6 +118,7 @@ checkRevisions psql db page = do
 processDocument :: CouchClient -> PsqlClient -> DbName -> DocId -> IO ()
 -- ^Responsible for processing a given couch document, including all of its revisions and attachments
 processDocument couch psql db doc = do
+    yield
     (_, details) <- concurrently ensureDoc fetchDoc
     Psql.withTransaction psql $ \transClient -> do
       let processRev = processRevision couch transClient db
@@ -114,6 +132,7 @@ processDocument couch psql db doc = do
 
 processRevision :: CouchClient -> PsqlClient -> DbName -> DocRevInfo -> IO ()
 processRevision couch psql db docRev  = do
+    yield
     ensureRev
     processDetails $ Couch.docRevStatus docRev
     return ()
@@ -126,6 +145,7 @@ processRevision couch psql db docRev  = do
 
 processAttachment :: CouchClient -> PsqlClient -> DbName -> DocId -> AttachmentStub -> IO ()
 processAttachment couch psql db doc att = do
+    yield
     (_, content) <- concurrently ensureAtt fetchContent
     ensureAttContent content
     return ()
@@ -136,6 +156,7 @@ processAttachment couch psql db doc att = do
 
 processDocumentChange :: CouchClient -> PsqlClient -> DbName -> Couch.DocChange -> IO ()
 processDocumentChange couch psql dbName change = do
+    yield
     _ <- mapConcurrently procRev docRevInfos
     if isDeleted then Psql.noteDeletedDocument psql dbName doc else return ()
   where

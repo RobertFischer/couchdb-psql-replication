@@ -86,7 +86,7 @@ data RevRecord = RevRecord
   {
     revRecordDb :: DbName,
     docRev :: DocRev
-  }
+  } deriving (Show)
 
 instance Db.FromRow RevRecord where
   fromRow = RevRecord <$>

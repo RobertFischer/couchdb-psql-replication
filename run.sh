@@ -7,9 +7,9 @@ export PSQL_PASS
 
 # Comment these out for ludicrious speed
 # Uncomment these for debugging 
-#export COUCH_CONCURRENCY=2
+#export COUCH_CONCURRENCY=1
 #export PSQL_CONCURRENCY=2
 
 echo
 
-stack build 2>&1 && stack exec exe 
+stack build 2>&1 && nice --adjustment=19 stack exec exe 
