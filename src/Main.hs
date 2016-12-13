@@ -12,17 +12,15 @@ import Data.Maybe ( Maybe(..) )
 import qualified Config
 import qualified Couch
 import qualified Psql
-import System.Remote.Monitoring as EKG
+--import System.Remote.Monitoring as EKG
 import System.Timeout
 
 type CouchClient = Couch.Client
 type PsqlClient = Psql.Client
 
--- TODO Attach EKG
-
 main :: IO ()
 main = do
-    _ <- EKG.forkServer "localhost" 41100
+    --_ <- EKG.forkServer "localhost" 41100
     config <- Config.readConfig
     psql <- Psql.makeClient config
     couch <- Couch.makeClient config

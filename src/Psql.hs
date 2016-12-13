@@ -322,7 +322,7 @@ tableColumnSql client table
 checkRevisionExists :: Client -> DbName -> DocRev -> IO Bool
 -- ^Determine if a given revision exists within the given database.
 checkRevisionExists client db doc = do
-    Config.logInfo $ "Checking if revision exists: DB[" ++ dbName ++ "] rev[" ++ rev ++ "]"
+    Config.logInfo $ "Checking if revision exists: " ++ (show db) ++ " " ++ (show doc)
     withConn client $ \conn -> do
       result <- (Db.query conn sql [dbName, rev])
       return $ case result of
