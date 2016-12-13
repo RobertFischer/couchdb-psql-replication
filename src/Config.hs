@@ -14,7 +14,6 @@ import System.IO
 import GHC.Word
 import Database.PostgreSQL.Simple ( ConnectInfo(..), defaultConnectInfo )
 import System.Environment ( lookupEnv )
-import Data.Maybe ( maybe )
 
 -- |Represents a location of a server on the Internet
 data ServerAddress = ServerAddress
@@ -75,36 +74,65 @@ instance Default ReplConfig where
       psqlDb = connectDatabase defaultConnectInfo
     }
 
+class Parseable a where
+  parseStr :: String -> a
+
+instance Parseable Int where
+  parseStr = read
+
+instance Parseable String where
+  parseStr = id
+
+instance Parseable Word16 where
+  parseStr = read
+
 readConfig :: IO ReplConfig
 -- ^Reads the configuration from the environment, with default values being
 -- used if they are not specified.
-readConfig =
+readConfig = do
+  logInfo "Loading configuration"
   ReplConfig <$>
     readCouchServerConfig <*>
     readPsqlServerConfig <*>
-    fromDef "COUCH_STARTING_SEQUENCE" id startingSequence <*>
-    fromDef "COUCH_CONCURRENCY" read couchConcurrency <*>
-    fromDef "PSQL_CONCURRENCY" read psqlConcurrency <*>
-    fromDef "COUCH_POLL_SECONDS" read pollLength <*>
-    fromDef "PSQL_SCHEMA" id psqlSchemaName <*>
-    fromDef "PSQL_USER" id psqlUser <*>
-    fromDef "PSQ_PASS" id psqlPass <*>
-    fromDef "PSQL_DB" id psqlDb
+    startSeq <*>
+    couchConc <*>
+    psqlConc <*>
+    pollLen <*>
+    psqlSch <*>
+    psqlUsr <*>
+    psqlPss <*>
+    psqlD
   where
-    fromDef = readWithDef
+    fromDefZ :: String -> (ReplConfig -> Int) -> IO Int
+    fromDefZ = readWithDef
+    fromDefS :: String -> (ReplConfig -> String) -> IO String
+    fromDefS = readWithDef
+    startSeq = fromDefS "COUCH_STARTING_SEQUENCE" startingSequence
+    couchConc = fromDefZ "COUCH_CONCURRENCY" couchConcurrency
+    psqlConc = fromDefZ "PSQL_CONCURRENCY" psqlConcurrency
+    pollLen = fromDefZ "COUCH_POLL_SECONDS" pollLength
+    psqlSch = fromDefS "PSQL_SCHEMA" psqlSchemaName
+    psqlUsr = fromDefS "PSQL_USER" psqlUser
+    psqlPss = fromDefS "PSQL_PASS" psqlPass
+    psqlD = fromDefS "PSQL_DB" psqlDb
 
-readWithDef :: String -> (String -> b) -> (ReplConfig -> b) -> IO b
-readWithDef envVarName valConverter accessor = do
-  let defaultVal = accessor def
-  maybe defaultVal valConverter <$> lookupEnv envVarName
+readWithDef :: (Parseable b, Show b) => String -> (ReplConfig -> b) -> IO b
+readWithDef envVarName accessor = do
+    logInfo $ "Loading configuration from " ++ envVarName ++ " -- default is " ++ (show defaultVal)
+    maybeFoundStr <- (lookupEnv envVarName)
+    let val = maybe defaultVal parseStr maybeFoundStr
+    logInfo $ "Using value " ++ (show val) ++ " for " ++ envVarName ++ " configuration"
+    return val
+  where
+    defaultVal = accessor def
 
 readCouchServerConfig :: IO CouchServerAddress
 readCouchServerConfig = do
   CouchServerAddress <$>
     (
       ServerAddress <$>
-        ( readWithDef "COUCH_SERVER_PORT" read (fromIntegral . couchPort) ) <*>
-        ( readWithDef "COUCH_SERVER_HOST" id   couchHost )
+        ( readWithDef "COUCH_SERVER_PORT" (fromIntegral . couchPort) ) <*>
+        ( readWithDef "COUCH_SERVER_HOST" couchHost )
     )
 
 readPsqlServerConfig :: IO PsqlServerAddress
@@ -112,8 +140,8 @@ readPsqlServerConfig = do
   PsqlServerAddress <$>
     (
       ServerAddress <$>
-        ( readWithDef "PSQL_SERVER_PORT" read psqlPort ) <*>
-        ( readWithDef "PSQL_SERVER_HOST" id   psqlHost )
+        ( readWithDef "PSQL_SERVER_PORT" psqlPort ) <*>
+        ( readWithDef "PSQL_SERVER_HOST" psqlHost )
     )
 
 couchHostBS :: ReplConfig -> B.ByteString
@@ -131,20 +159,24 @@ psqlHost = serverName . unwrapPsqlServer . psqlServer
 psqlPort :: ReplConfig -> Word16
 psqlPort = serverPort . unwrapPsqlServer . psqlServer
 
-doLog :: String -> String -> IO ()
-doLog lvl str = do
+doLog :: Handle -> String -> String -> IO ()
+doLog h lvl str = do
     _ <- forkIO $ do
       hSetBuffering h LineBuffering
       hPutStr h $ "[" ++ lvl ++ "]\t" ++ str ++ "\n"
     return ()
-  where
-    h = stderr
+
+doLogStderr :: String -> String -> IO ()
+doLogStderr = doLog stderr
+
+doLogStdout :: String -> String -> IO ()
+doLogStdout = doLog stdout
 
 logWarn :: String -> IO ()
-logWarn = doLog "WARN"
+logWarn = doLogStderr "WARN"
 
 logError :: String -> IO ()
-logError = doLog "ERROR"
+logError = doLogStderr "ERROR"
 
 logInfo :: String -> IO ()
-logInfo = doLog "INFO"
+logInfo = doLogStdout "INFO"

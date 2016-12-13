@@ -170,7 +170,8 @@ ensureDdl baseClient = withTransaction baseClient $ \client -> do
   ensureIndex client RevTable "ord"
 
 ensureIndex :: Client -> Table -> IndexColumns -> IO ()
-ensureIndex client tbl colStr =
+ensureIndex client tbl colStr = do
+    Config.logInfo $ "Ensuring index " ++ idxName ++ " on " ++ tblSql
     withConn client $ \conn -> do
       _ <- Db.execute_ conn $ fromString
         (
@@ -184,7 +185,8 @@ ensureIndex client tbl colStr =
     idxName = toSql $ IndexName (tblName, colStr)
 
 ensureSchema :: Client -> Schema -> IO ()
-ensureSchema client schema =
+ensureSchema client schema = do
+    Config.logInfo $ "Ensuring schema " ++ name
     withConn client $ \conn -> do
       _ <- Db.execute_ conn $ fromString $ "CREATE SCHEMA IF NOT EXISTS " ++ name
       return ()
@@ -192,7 +194,8 @@ ensureSchema client schema =
     name = clientSchemaSql client schema
 
 ensureView :: Client -> Table -> IO ()
-ensureView client table =
+ensureView client table = do
+    Config.logInfo $ "Ensuring view " ++ name ++ " as: " ++ query
     withConn client $ \conn -> do
       _ <- Db.execute_ conn $ fromString $ "CREATE OR REPLACE VIEW " ++ name ++ " AS " ++ query
       return ()
@@ -204,14 +207,14 @@ viewQuerySql :: Client -> Table -> String
 viewQuerySql client table
     | tableSchema table == DataSchema = error ("No view query SQL for a data schema table: " ++ show table)
     | table == CurrentDbTable =
-        "SELECT DISTINCT ON (db.couchId) doc.id AS sqlId, db.couchId AS name, "
+        "SELECT DISTINCT ON (db.couchId) db.couchId AS name, "
         ++ " db.firstSyncAt AS firstSyncAt, db.lastSyncAt AS lastSyncAt"
         ++ " FROM " ++ dbTable ++ " db "
         ++ " INNER JOIN " ++ currDocTable ++ " doc  ON (doc.dbSqlId = db.id) "
         ++ " ORDER BY db.couchId, db.lastSyncAt DESC"
     | table == CurrentDocTable =
       "SELECT DISTINCT ON (db.couchId, doc.couchId) "
-      ++ " db.couchId AS dbName, db.id AS dbSqlId, doc.couchId AS couchId, doc.id AS sqlId "
+      ++ " db.couchId AS dbName, db.id AS dbSqlId, doc.couchId AS couchId, doc.id AS sqlId, "
       ++ " doc.firstSyncAt AS firstSyncAt, doc.lastSyncAt AS lastSyncAt "
       ++ " FROM " ++ docTable ++ " doc INNER JOIN " ++ dbTable ++ " db ON (doc.dbId = db.id) "
       ++ " INNER JOIN " ++ currRevTable ++ " rev ON (rev.docSqlId = doc.id) "
@@ -255,13 +258,13 @@ viewQuerySql client table
 
 
 ensureTable :: Client -> Table -> IO ()
-ensureTable client table =
+ensureTable client table = do
+    Config.logInfo $ "Ensuring table " ++ name ++ " => " ++ sql
     withConn client $ \conn -> do
-      _ <- Db.execute_ conn $ fromString $
-        "CREATE TABLE IF NOT EXISTS " ++ name ++
-        " ( " ++ columns ++ " ) " ++ inheritance
+      _ <- Db.execute_ conn $ fromString sql
       return ()
   where
+    sql = "CREATE TABLE IF NOT EXISTS " ++ name ++ " ( " ++ columns ++ " ) " ++ inheritance
     name = clientTableSql client table
     columns = tableColumnSql client table
     parentTables = (clientTableSql client) <$> (tableInheritance table)
@@ -281,39 +284,45 @@ tableColumnSql :: Client -> Table -> String
 tableColumnSql client table
     | tableSchema table == ViewSchema = error ("No column table SQL for a view schema table: " ++ show table)
     | table == BaseTable = "id BIGSERIAL PRIMARY KEY, firstSyncAt " ++ nowTime ++ ", lastSyncAt" ++ nowTime
-    | table == BaseObjectTable = multi [ "couchId VARCHAR NOT NULL", "deletedAt TIMESTAMPZ NULL DEFAULT NULL"]
-    | table == DbTable = "UNIQUE (couchId)"
-    | table == DocTable = multi [ refsTable "dbId" DbTable, "UNIQUE (dbId, couchId)" ]
+    | table == BaseObjectTable = multi [ "couchId VARCHAR NOT NULL", "deletedAt TIMESTAMPTZ NULL DEFAULT NULL"]
+    | table == DbTable = multi [ uniqueId, "UNIQUE (couchId)" ]
+    | table == DocTable = multi [ uniqueId, refsTable "dbId" DbTable, "UNIQUE (dbId, couchId)" ]
     | table == RevTable = multi [
+        uniqueId,
         refsTable "docId" DocTable,
         "ord SMALLINT NOT NULL",
         "UNIQUE (docId, couchId)"
       ]
     | table == RevContentTable = multi [
+        uniqueId,
         refsTable "revId" RevTable,
         "revContent JSONB NOT NULL UNIQUE"
       ]
     | table == AttTable = multi [
+        uniqueId,
         refsTable "revId" RevTable,
         "contentType VARCHAR NOT NULL",
         "UNIQUE (revId, couchId)"
       ]
     | table == AttContentTable = multi [
+        uniqueId,
         refsTable "attId" AttTable,
-        "attContent BYTEA NOT NULL UNIQUE",
+        "attContent BYTEA NOT NULL",
         "gzipped BOOLEAN NOT NULL DEFAULT TRUE"
       ]
     | otherwise = error ("Table is not known: " ++ (show table))
   where
+    uniqueId = "UNIQUE(id)"
     multi = intercalate ", "
-    tableName' = clientTableSql client
-    refsTable colName tbl = colName ++ " BIGINT REFERENCES " ++ (tableName' tbl) ++ refChange
+    tableName' tbl = clientTableSql client tbl
+    refsTable colName tbl = colName ++ " BIGINT REFERENCES " ++ (tableName' tbl) ++ " (id) " ++ refChange
     refChange = " ON UPDATE CASCADE ON DELETE RESTRICT "
-    nowTime = "TIMESTAMPZ NOT NULL DEFAULT NOW()"
+    nowTime = " TIMESTAMPTZ NOT NULL DEFAULT NOW() "
 
 checkRevisionExists :: Client -> DbName -> DocRev -> IO Bool
 -- ^Determine if a given revision exists within the given database.
-checkRevisionExists client db doc =
+checkRevisionExists client db doc = do
+    Config.logInfo $ "Checking if revision exists: DB[" ++ dbName ++ "] rev[" ++ rev ++ "]"
     withConn client $ \conn -> do
       result <- (Db.query conn sql [dbName, rev])
       return $ case result of
@@ -324,9 +333,11 @@ checkRevisionExists client db doc =
     dbName = dbNameStr db
     rev = revId $ docRevId doc
     revTable = clientTableSql client RevTable
+    docTable = clientTableSql client DocTable
     dbTable = clientTableSql client DbTable
     sql = fromString $ "SELECT EXISTS( SELECT * FROM " ++ revTable ++ " r " ++
-      "INNER JOIN " ++ dbTable ++ " d ON (r.dbId = d.id) " ++
+      "INNER JOIN " ++ docTable ++ " doc ON (r.docId = doc.id) " ++
+      "INNER JOIN " ++ dbTable ++ " d ON (doc.dbId = d.id) " ++
       "WHERE d.couchId = ? AND r.couchId = ? )"
 
 withTransaction :: Client -> (Client -> IO a) -> IO a
@@ -370,28 +381,34 @@ callDb client sql params = do
     return ()
 
 ensureDatabase :: Client -> DbName -> IO ()
-ensureDatabase client (DbName db) = callDb client sql [db]
+ensureDatabase client (DbName db) = do
+    Config.logInfo $ "Ensuring database:\t" ++ dbTbl
+    callDb client sql [db]
   where
     dbTbl = clientTableSql client DbTable
     sql = "INSERT INTO " ++ dbTbl ++ " (couchId) VALUES (?) " ++
       onConflictNoteSync
 
 ensureDocument :: Client -> DbName -> DocId -> IO ()
-ensureDocument client (DbName db) (DocId doc) = callDb client sql [db, doc]
+ensureDocument client (DbName db) (DocId doc) = do
+    Config.logInfo $ "Ensuring document:\tDB[" ++ db ++ "] Doc[" ++ doc ++ "]"
+    callDb client sql [db, doc]
   where
     sql = "INSERT INTO " ++ docTable ++ " (dbId, couchId) " ++
-      "VALUES (SELECT id FROM " ++ dbTable ++ " WHERE couchId = ?, ?) " ++
-      onConflictNoteSync
+      " VALUES ( (SELECT id FROM " ++ dbTable ++ " WHERE couchId = ?), ?) " ++
+      " ON CONFLICT (dbId, couchId) DO UPDATE SET lastSyncAt = NOW()"
     docTable = clientTableSql client DocTable
     dbTable = clientTableSql client DbTable
 
 ensureRevision :: Client -> DbName -> DocRev -> IO ()
-ensureRevision client (DbName db) dRev = callDb client sql (db, doc, rev, ord)
+ensureRevision client (DbName db) dRev = do
+    Config.logInfo $ "Ensuring revision:\tDB[" ++ db ++ "] Doc[" ++ doc ++ "]" ++ " Rev[" ++ rev ++ "]"
+    callDb client sql (db, doc, rev, ord)
   where
     sql = "INSERT INTO " ++ revTable ++ " (docId, couchId, ord) " ++
       " VALUES ( " ++
-        " SELECT d.id FROM " ++ docTable ++ " doc INNER JOIN " ++ dbTable ++ " db " ++
-        " ON (db.id = doc.dbId) WHERE db.couchId = ? AND d.couchId = ? ," ++
+        " (SELECT d.id FROM " ++ docTable ++ " doc INNER JOIN " ++ dbTable ++ " db " ++
+        " ON (db.id = doc.dbId) WHERE db.couchId = ? AND d.couchId = ? ) ," ++
         " ?, ?" ++
         " ) " ++ onConflictNoteSync ++ ", ord = EXCLUDED.ord"
     doc = docIdStr $ docId dRev
@@ -403,17 +420,18 @@ ensureRevision client (DbName db) dRev = callDb client sql (db, doc, rev, ord)
     dbTable = clientTableSql client DbTable
 
 ensureRevisionContent :: Client -> DbName -> DocRev -> DocDetails -> IO ()
-ensureRevisionContent client (DbName db) dRev docDetails =
+ensureRevisionContent client (DbName db) dRev docDetails = do
+    Config.logInfo $ "Ensuring revision content:\tDB[" ++ db ++ "] Doc[" ++ doc ++ "]" ++ " Rev[" ++ rev ++ "]"
     callDb client sql (db, doc, rev, jsonb)
   where
     doc = docIdStr $ docId dRev
     rev = revId $ docRevId dRev
     jsonb = Json.encode $ docContent docDetails
     sql = "INSERT INTO " ++ revContTable ++ " (revId, revContent) VALUES ( "
-      ++ " SELECT rev.id FROM " ++ revTable ++ " rev "
+      ++ " ( SELECT rev.id FROM " ++ revTable ++ " rev "
       ++ " INNER JOIN " ++ docTable ++ " doc ON (rev.docId = doc.id) "
       ++ " INNER JOIN " ++ dbTable ++ "db ON (doc.dbId = db.id) "
-      ++ " WHERE db.couchId = ? AND doc.couchId = ? AND rev.couchId = ? ,"
+      ++ " WHERE db.couchId = ? AND doc.couchId = ? AND rev.couchId = ? ) ,"
       ++ " ? "
       ++ " ) " ++ onConflictNoteSync
     tblSql = clientTableSql client
@@ -423,11 +441,13 @@ ensureRevisionContent client (DbName db) dRev docDetails =
     dbTable = tblSql DbTable
 
 noteDeletedRevision :: Client -> DbName -> DocRev -> IO ()
-noteDeletedRevision client (DbName db) dRev = callDb client sql [db, doc, rev]
+noteDeletedRevision client (DbName db) dRev = do
+    Config.logInfo $ "Note deleted revision:\tDB[" ++ db ++ "] Doc[" ++ doc ++ "]" ++ " Rev[" ++ rev ++ "]"
+    callDb client sql [db, doc, rev]
   where
     doc = docIdStr $ docId dRev
     rev = revId $ docRevId dRev
-    sql = "UPDATE " ++ revTable ++ " rev SET deletedAt = COALESCE(rev.deletedAt, NOW()), lastSyncAt = NOW() "
+    sql = "UPDATE " ++ revTable ++ " rev SET deletedAt = LEAST(rev.deletedAt, NOW()), lastSyncAt = NOW() "
       ++ " FROM " ++ docTable ++ " doc INNER JOIN " ++ dbTable ++ " db ON (doc.dbId = db.id)"
       ++ " WHERE rev.docId = doc.id AND "
       ++ " db.couchId = ? AND doc.couchId = ? AND rev.couchId = ? "
@@ -437,9 +457,11 @@ noteDeletedRevision client (DbName db) dRev = callDb client sql [db, doc, rev]
     dbTable = tblSql DbTable
 
 noteDeletedDocument :: Client -> DbName -> DocId -> IO ()
-noteDeletedDocument client (DbName db) (DocId doc) = callDb client sql [db, doc]
+noteDeletedDocument client (DbName db) (DocId doc) = do
+    Config.logInfo $ "Note deleted document:\tDB[" ++ db ++ "] Doc[" ++ doc ++ "]"
+    callDb client sql [db, doc]
   where
-    sql = "UPDATE " ++ docTable ++ " doc SET deletedAt = COALESCE(doc.deletedAt, NOW()), lastSyncAt = NOW() "
+    sql = "UPDATE " ++ docTable ++ " doc SET deletedAt = LEAST(doc.deletedAt, NOW()), lastSyncAt = NOW() "
       ++ " FROM " ++ dbTable ++ " db "
       ++ " WHERE doc.dbId = db.id AND db.couchId = ? and doc.couchId = ? "
     tblSql = clientTableSql client
@@ -447,19 +469,21 @@ noteDeletedDocument client (DbName db) (DocId doc) = callDb client sql [db, doc]
     dbTable = tblSql DbTable
 
 ensureAttachment :: Client -> DbName -> DocId -> AttachmentStub -> IO ()
-ensureAttachment client (DbName db) (DocId doc) att = callDb client sql (db, doc, rOrd, name, contentType)
+ensureAttachment client (DbName db) (DocId doc) att = do
+    Config.logInfo $ "Ensure attachment:\tDB[" ++ db ++ "] Doc[" ++ doc ++ "] Name[" ++ name ++ "]"
+    callDb client sql (db, doc, rOrd, name, contentType)
   where
     rOrd = attRevPos att
     name = attName att
     contentType = attContentType att
     sql = "INSERT INTO " ++ attTable ++ " (revId, couchId, contentType) VALUES ( "
-      ++ " SELECT rev.id FROM " ++ revTable ++ " rev "
+      ++ " ( SELECT rev.id FROM " ++ revTable ++ " rev "
       ++ " INNER JOIN " ++ docTable ++ " doc ON (rev.docId = doc.id) "
       ++ " INNER JOIN " ++ dbTable ++ "db ON (doc.dbId = db.id) "
       ++ " WHERE db.couchId = ? AND doc.couchId = ? AND rev.ord = ? "
       ++ " ORDER BY rev.deletedAt DESC NULLS LAST, rev.lastSyncAt DESC"
-      ++ " LIMIT 1 "
-      ++ " , ?, ? "
+      ++ " LIMIT 1 ) ,"
+      ++ " ?, ? "
       ++ " ) " ++ onConflictNoteSync ++ ", contentType = EXCLUDED.contentType"
     tblSql = clientTableSql client
     revTable = tblSql RevTable
@@ -468,7 +492,9 @@ ensureAttachment client (DbName db) (DocId doc) att = callDb client sql (db, doc
     attTable = tblSql AttTable
 
 ensureAttachmentContent :: Client -> DbName -> DocId -> AttachmentStub -> ByteString -> IO ()
-ensureAttachmentContent client (DbName db) (DocId doc) att content = callDb client sql (db, doc, rOrd, name, binContent)
+ensureAttachmentContent client (DbName db) (DocId doc) att content = do
+    Config.logInfo $ "Ensure attachment content:\tDB[" ++ db ++ "] Doc[" ++ doc ++ "] Name[" ++ name ++ "]"
+    callDb client sql (db, doc, rOrd, name, binContent)
   where
     binContent = Db.Binary $ Psql.compress content
     name = attName att
@@ -480,28 +506,30 @@ ensureAttachmentContent client (DbName db) (DocId doc) att content = callDb clie
     attTable = tblSql AttTable
     attContentTable = tblSql AttContentTable
     sql = "INSERT INTO " ++ attContentTable ++ " cnt (gzipped, attId, attContent) VALUES (True, "
-      ++ " SELECT attId FROM " ++ attTable ++ " att "
+      ++ " ( SELECT attId FROM " ++ attTable ++ " att "
       ++ " INNER JOIN " ++ revTable ++ " rev ON (att.revId = rev.id) "
       ++ " INNER JOIN " ++ docTable ++ " doc ON (rev.docId = doc.id) "
       ++ " INNER JOIN " ++ dbTable ++ " db ON (rev.dbId = db.id) "
       ++ " WHERE db.couchId = ? AND doc.couchId = ? AND rev.ord = ? AND att.couchId = ? "
       ++ " ORDER BY rev.deletedAt DESC NULLS LAST, att.lastSyncAt DESC, rev.lastSyncAt DESC "
-      ++ " LIMIT 1 "
-      ++ ", ?"
-      ++ " ) " ++ onConflictNoteSync ++ ", gzipped = EXCLUDED.gzipped, attContent = EXCLUDED.attContent "
+      ++ " LIMIT 1 ), "
+      ++ " ? "
+      ++ " ) "
 
 fetchLiveRevisions :: Client -> IO [RevRecord]
-fetchLiveRevisions client = withConn client $ \conn -> Db.query_ conn (fromString sql)
+fetchLiveRevisions client = do
+    Config.logInfo $ "Fetch live revisions"
+    withConn client $ \conn -> Db.query_ conn (fromString sql)
   where
     sql = "SELECT DISTINCT ON(db.id, doc.id) db.couchId, doc.couchId, rev.ord, rev.couchId "
       ++ " FROM " ++ dbTable ++ " db "
       ++ " INNER JOIN " ++ docTable ++ " doc ON (doc.dbId = db.id) "
       ++ " INNER JOIN " ++ revTable ++ " rev ON (rev.docId = doc.id) "
       ++ " WHERE doc.deletedAt IS NULL AND rev.deletedAt IS NULL "
-      ++ " ORDER BY db.couchId, doc.firstSyncAt, rev.ord DESC "
+      ++ " ORDER BY db.id, doc.id, doc.firstSyncAt, rev.ord DESC "
     dbTable = clientTableSql client DbTable
     docTable = clientTableSql client DocTable
     revTable = clientTableSql client RevTable
 
 onConflictNoteSync :: String
-onConflictNoteSync = "ON CONFLICT DO UPDATE SET lastSyncAt = NOW()"
+onConflictNoteSync = "ON CONFLICT (couchId) DO UPDATE SET lastSyncAt = NOW()"
