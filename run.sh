@@ -7,8 +7,8 @@ export PSQL_PASS
 
 # Comment these out for ludicrious speed
 # Uncomment these for debugging 
-export COUCH_CONCURRENCY=1
-export PSQL_CONCURRENCY=2
+#export COUCH_CONCURRENCY=2
+#export PSQL_CONCURRENCY=2
 
 echo
 
