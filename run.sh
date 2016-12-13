@@ -12,4 +12,4 @@ export PSQL_PASS
 
 echo
 
-stack build 2>&1 && nice --adjustment=19 stack exec exe 
+stack build 2>&1 && nice --adjustment=19 stack exec exe 2>&1 

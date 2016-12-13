@@ -5,6 +5,7 @@
 
 module Main where
 
+import Control.Monad ( liftM2 )
 import Control.Concurrent ( yield )
 import Control.Concurrent.Async
 import Couch ( DocId, DbName, DbPage, DocRevInfo, AttachmentStub, docId )
@@ -34,9 +35,9 @@ main = do
       Config.logInfo "Loading live revisions"
       liveRevs <- Psql.fetchLiveRevisions psql
       Config.logInfo "Processing live revisions"
-      _ <- mapConcurrently (processRevisionRecord couch psql) liveRevs
+      _ <- mapConcurrentlyLimit 10 (processRevisionRecord couch psql) liveRevs
       Config.logInfo "Processing databases"
-      _ <- mapConcurrently upDb dbs
+      _ <- mapConcurrentlyLimit 2 upDb dbs
       let timeoutSecs = Config.pollLength config
       Config.logInfo $ "Waiting for changeset polling timeout:\t" ++ (show timeoutSecs) ++"s"
       _ <- timeout timeoutSecs $ wait pollPromise
@@ -84,8 +85,8 @@ processDatabasePage couch psql db page = do
     yield
     Config.logInfo $ "Processing database page:\t" ++ (show db) ++ "\t" ++ (show page)
     (missingIds, presentIds) <- checkRevs page
-    _ <- mapConcurrently processDoc missingIds
-    let runPresent = mapConcurrently processDoc presentIds
+    _ <- mapConcurrentlyLimit 10 processDoc missingIds
+    let runPresent = mapConcurrentlyLimit 2 processDoc presentIds
     let runNextPage = processNext $ Couch.maxKey page
     _ <- concurrently runPresent runNextPage
     return ()
@@ -104,14 +105,16 @@ checkRevisions :: PsqlClient -> DbName -> DbPage -> IO ([DocId], [DocId])
 -- The left/'fst' list of tuple are the missing ids, and the right/'snd' list of the tuple are the found ids.
 checkRevisions psql db page = do
     yield
-    checked <- mapConcurrently check revList
+    checked <- mapConcurrentlyLimit 10 check revList
     let checkedPairs = zip checked revList
     let (presentPairs, missingPairs) = partition fst checkedPairs
     let mapSndDoc = map $ docId . snd
     let present = mapSndDoc presentPairs
     let missing = mapSndDoc missingPairs
+    Config.logInfo $ "Found " ++ (size present) ++ " present documents; " ++ (size missing) ++ " missing documents."
     return (missing, present)
   where
+    size = show . length
     revList = Couch.toDocRevList page
     check = Psql.checkRevisionExists psql db
 
@@ -119,13 +122,15 @@ processDocument :: CouchClient -> PsqlClient -> DbName -> DocId -> IO ()
 -- ^Responsible for processing a given couch document, including all of its revisions and attachments
 processDocument couch psql db doc = do
     yield
+    Config.logInfo $ "Processing document " ++ (show db) ++ " " ++ (show doc)
     (_, details) <- concurrently ensureDoc fetchDoc
     Psql.withTransaction psql $ \transClient -> do
       let processRev = processRevision couch transClient db
       let processAtt = processAttachment couch transClient db doc
-      _ <- mapConcurrently processRev $ Couch.docRevsInfo details
-      _ <- mapConcurrently processAtt $ Couch.docAttachmentsList details
-      if (Couch.docDetailsDeleted details) then (Psql.noteDeletedDocument psql db doc) else ( return () )
+      _ <- mapConcurrentlyLimit 10 processRev $ Couch.docRevsInfo details
+      _ <- mapConcurrentlyLimit 2 processAtt $ Couch.docAttachmentsList details
+      if (Couch.docDetailsDeleted details) then (Psql.noteDeletedDocument transClient db doc) else ( return () )
+      Config.logInfo $ "Committing transaction for " ++ (show db) ++ " " ++ (show doc)
   where
     ensureDoc = Psql.ensureDocument psql db doc
     fetchDoc = Couch.getDocDetails couch db doc
@@ -133,6 +138,7 @@ processDocument couch psql db doc = do
 processRevision :: CouchClient -> PsqlClient -> DbName -> DocRevInfo -> IO ()
 processRevision couch psql db docRev  = do
     yield
+    Config.logInfo $ "Processing revision " ++ (show db) ++ " " ++ (show docRev)
     ensureRev
     processDetails $ Couch.docRevStatus docRev
     return ()
@@ -147,6 +153,7 @@ processAttachment :: CouchClient -> PsqlClient -> DbName -> DocId -> AttachmentS
 processAttachment couch psql db doc att = do
     yield
     (_, content) <- concurrently ensureAtt fetchContent
+    Config.logInfo $ "Processing attachment " ++ (show db) ++ " " ++ (show doc) ++ " " ++ (show att)
     ensureAttContent content
     return ()
   where
@@ -157,7 +164,7 @@ processAttachment couch psql db doc att = do
 processDocumentChange :: CouchClient -> PsqlClient -> DbName -> Couch.DocChange -> IO ()
 processDocumentChange couch psql dbName change = do
     yield
-    _ <- mapConcurrently procRev docRevInfos
+    _ <- mapConcurrentlyLimit 5 procRev docRevInfos
     if isDeleted then Psql.noteDeletedDocument psql dbName doc else return ()
   where
     procRev = processRevision couch psql dbName
@@ -173,3 +180,14 @@ processDocumentChange couch psql dbName change = do
       }
     doc = Couch.changedDocId change
     isDeleted = Couch.docDeleted change
+
+mapConcurrentlyLimit :: Int -> (a -> IO b) -> [a] -> IO ([b])
+mapConcurrentlyLimit i f l = loop l
+  where
+    loop [] = return []
+    loop xs = concatBs startBs restBs
+      where
+        (start,rest) = splitAt i xs
+        startBs = mapConcurrently f start
+        restBs = loop rest
+        concatBs = liftM2 (++)

@@ -321,6 +321,7 @@ pathToRequest :: String -> IO HttpRequest
 pathToRequest ('/':path) = pathToRequest path
 pathToRequest path = do
     yield
+    Config.logInfo $ "Loading path:\t" ++ path
     HTTP.parseRequest fullPath
   where
     fullPath = "GET http://couch/" ++ path
